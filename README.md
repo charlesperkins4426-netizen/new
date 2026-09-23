@@ -206,6 +206,29 @@ ssh -L 8000:127.0.0.1:8000 your-user@your-server
 然后在本机打开 `http://127.0.0.1:8000/`。不要为了方便直接把无鉴权后台暴露到公网。
 反向代理若用于可信网络，需要关闭 SSE 缓冲，并使用足够长的读取超时；仍须自行保护后台路径。
 
+### 子路径部署与「API not found」
+
+后台使用相对于页面的资源和 API 地址，支持根路径 `/` 或 `/dialx/` 等子路径。子路径入口必须以 `/` 结尾。代理须去掉此前缀，并把页面、`static/`、`api/admin/` 和 `v1/` 转给同一个 FastAPI 端口。
+
+例如公开入口为 `https://example.com/dialx/` 时，管理接口是 `/dialx/api/admin/overview`，OpenAI 客户端的 `base_url` 是 `https://example.com/dialx/v1`。不要把该站点根路径 `/api/` 或 `/v1/` 全部改到本程序，以免影响同域名的其他服务。
+
+```nginx
+location = /dialx { return 308 /dialx/; }
+location ^~ /dialx/ {
+    # 在此保留已有的访问控制；此示例本身不提供后台鉴权。
+    proxy_pass http://127.0.0.1:8000/;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_read_timeout 600s;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+不要使用 `sub_filter` 注入内联脚本来修改 fetch 地址。程序的 CSP 会阻止内联脚本，且本版不需要这些脚本。保留站点已有登录保护；如需独立开放 `/dialx/v1/`，仅为该路径保留调用 Key 校验，不应开放管理接口。
+
+若出现「API not found」，先在部署机器请求实际端口的 `/healthz` 和 `/api/admin/overview`，再检查浏览器的失败请求是否保留子路径。这条错误也可能来自同域名的其他 API 服务；不要通过替换 Cookie 处理路由错误。
+
 ## 测试与打包
 
 源仓库包含测试与真实脱敏回放帧；发行 ZIP 只包含运行所需程序和说明。

@@ -16,7 +16,7 @@ export async function responseError(response) {
 export async function api(path, { method = 'GET', body, signal } = {}) {
   let response;
   try {
-    response = await fetch(`/api/admin/${path}`, {
+    response = await fetch(`api/admin/${path}`, {
       method, signal, cache: 'no-store', credentials: 'same-origin',
       headers: body === undefined ? { Accept: 'application/json' } : { Accept: 'application/json', 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),

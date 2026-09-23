@@ -32,6 +32,8 @@ function fixture() {
   const catalog = () => ({ data: models, default_model: defaultModel, updated_at: '2026-09-23T14:00:00Z', stale: false, error: null, total_count: 2, applications_count: 0 });
   const json = (value) => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
   window.fetch = async (url, options = {}) => {
+    const resolved = new URL(url, 'https://test.invalid/');
+    url = resolved.pathname + resolved.search;
     const body = options.body ? JSON.parse(options.body) : null;
     window.__requests.push({ url, method: options.method || 'GET', headers: options.headers, body });
     if (url === '/api/admin/overview') return json({ service: { status: 'ok', uptime_seconds: 3600 }, default_model: null,
@@ -72,8 +74,8 @@ function fixture() {
 }
 
 const html = readFileSync(join(web, 'index.html'), 'utf8')
-  .replace('<link rel="stylesheet" href="/static/styles.css">', `<style>${readFileSync(join(web, 'styles.css'), 'utf8')}</style>`)
-  .replace('<script type="module" src="/static/app.js"></script>', `<script>(${fixture.toString().replaceAll('</script', '<\\/script')})()</script><script type="module" src="${moduleURL('app.js')}"></script>`);
+  .replace('<link rel="stylesheet" href="static/styles.css">', `<style>${readFileSync(join(web, 'styles.css'), 'utf8')}</style>`)
+  .replace('<script type="module" src="static/app.js"></script>', `<script>(${fixture.toString().replaceAll('</script', '<\\/script')})()</script><script type="module" src="${moduleURL('app.js')}"></script>`);
 const path = join(temporary, 'index.html');
 writeFileSync(path, html);
 const session = `dialx-ui-smoke-${process.pid}`;

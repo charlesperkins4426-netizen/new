@@ -115,7 +115,7 @@ export async function renderChat(root, { signal, navigate }) {
     thread.scrollTop = thread.scrollHeight;
     syncControls();
     try {
-      const response = await fetch('/v1/chat/completions', {
+      const response = await fetch('v1/chat/completions', {
         method: 'POST', signal: controller.signal, cache: 'no-store', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', Authorization: `Bearer ${conversation.key}` },
         body: JSON.stringify({ model: model.value, messages: history, stream: true }),
