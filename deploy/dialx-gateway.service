@@ -1,0 +1,19 @@
+[Unit]
+Description=DialX OpenAI-compatible gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dialx
+Group=dialx
+WorkingDirectory=/opt/dialx-gateway
+ExecStart=/opt/dialx-gateway/venv/bin/python /opt/dialx-gateway/app.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
