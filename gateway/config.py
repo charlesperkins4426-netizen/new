@@ -35,7 +35,7 @@ class Settings:
     api_token: str = "123456"
     default_model: str = ""
     model_cache_ttl: int = 3600
-    upstream_timeout: float = 120
+    upstream_timeout: float = 1800
     connect_timeout: float = 15
     cooldown_seconds: int = 60
     account_wait_seconds: float = 2
@@ -48,7 +48,7 @@ class Settings:
 
 _DEFAULTS = {
     "HOST": "127.0.0.1", "PORT": "8000", "API_TOKEN": "123456", "DEFAULT_MODEL": "",
-    "MODEL_CACHE_TTL": "3600", "UPSTREAM_TIMEOUT": "120", "CONNECT_TIMEOUT": "15",
+    "MODEL_CACHE_TTL": "3600", "UPSTREAM_TIMEOUT": "1800", "CONNECT_TIMEOUT": "15",
     "COOLDOWN_SECONDS": "60", "ACCOUNT_WAIT_SECONDS": "2", "LOG_RETENTION_DAYS": "7",
     "MAX_FRAME_BYTES": "2097152", "MAX_RESPONSE_BYTES": "16777216", "DATA_DIR": "data",
     "DIALX_ENABLED_TOOLSETS": "[]", "DIALX_COOKIES": "", "DIALX_ACCOUNTS": "[]",

@@ -30,6 +30,8 @@ def test_defaults_immutable_snapshots_and_permissions(store):
     assert store.settings.host == "127.0.0.1"
     assert store.settings.port == 8000
     assert store.settings.api_token == "123456"
+    assert store.settings.upstream_timeout == 1800
+    assert store.settings.connect_timeout == 15
     assert store.settings.data_dir == store.path.parent / "data"
     assert store.settings.enabled_toolsets == ()
     assert store.accounts() == []

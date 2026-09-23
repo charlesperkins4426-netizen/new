@@ -92,7 +92,8 @@ async def test_different_accounts_parallel_same_account_serial(pool):
             assert first.client.headers["x-timezone"] == "UTC"
             assert first.client.headers["x-language"] == "en"
             assert not first.client.follow_redirects
-            assert first.client.timeout.read == 120
+            assert first.client.timeout.read == 1800
+            assert first.client.timeout.write == 1800
             assert first.client.timeout.connect == 15
             await assert_lease_error(pool, "accounts_busy", account_id=ids[0], for_check=True)
 

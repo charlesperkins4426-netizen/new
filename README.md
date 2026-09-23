@@ -206,6 +206,8 @@ ssh -L 8000:127.0.0.1:8000 your-user@your-server
 然后在本机打开 `http://127.0.0.1:8000/`。不要为了方便直接把无鉴权后台暴露到公网。
 反向代理若用于可信网络，需要关闭 SSE 缓冲，并使用足够长的读取超时；仍须自行保护后台路径。
 
+默认 `UPSTREAM_TIMEOUT=1800` 秒，`CONNECT_TIMEOUT=15` 秒。前者控制上游连续无数据的读写等待，不是整次回答的总时长限制。升级不会覆盖已有 `.env`；已有部署需要自行修改该配置并重启。反向代理的读取和发送超时也须同步设置为 `1800s`，避免代理先关闭连接。
+
 ### 子路径部署与「API not found」
 
 后台使用相对于页面的资源和 API 地址，支持根路径 `/` 或 `/dialx/` 等子路径。子路径入口必须以 `/` 结尾。代理须去掉此前缀，并把页面、`static/`、`api/admin/` 和 `v1/` 转给同一个 FastAPI 端口。
@@ -219,7 +221,8 @@ location ^~ /dialx/ {
     proxy_pass http://127.0.0.1:8000/;
     proxy_http_version 1.1;
     proxy_buffering off;
-    proxy_read_timeout 600s;
+    proxy_read_timeout 1800s;
+    proxy_send_timeout 1800s;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
 }
