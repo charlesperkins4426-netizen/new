@@ -16,9 +16,17 @@
 - Cookie 续期、默认模型与账号启停原子写回 `.env`，重启保留。
 - 工具默认关闭。原生模型工具绑定未验证，因此卡片保持不可用，不伪造开关成功。
 - 没有已验证的美元余额、订阅或试用接口，这些字段显示“未提供”。模型 cost 配额不当成美元余额。
-- 仅支持 `model`、文本 `messages`、`stream` 和 `temperature`。未知参数、图片、工具调用、JSON Schema、`max_tokens`、`stream_options` 等返回明确 400，不静默忽略。
+- 原生映射仅支持 `model`、文本 `messages`、`stream` 和 `temperature`。默认严格校验；可显式开启下述四个生成参数的兼容忽略模式。其他未知参数、图片、工具调用、JSON Schema 和 `stream_options` 等仍返回明确 400。
 - 上游没有提供已验证的 token usage，返回 `usage: null`，不编造用量。
 - 应用可能包含预置工具，因此只开放支持聊天的原生模型，不把应用当成模型。
+
+### 兼容客户端附带的生成参数
+
+某些客户端会附带 `max_tokens`、`presence_penalty`、`frequency_penalty` 和 `top_logprobs`。DialX 网页接口没有已验证的映射来保证这些参数生效：真实测试中，`max_tokens=1` 仍返回了完整的六词回答，也没有得到 logprobs 数据。模型目录的能力标记不等于网页接口会转发这些参数。
+
+默认 `IGNORE_UNSUPPORTED_PARAMS=false`，仍严格拒绝这些字段。如接受忽略这四个字段，可设置 `IGNORE_UNSUPPORTED_PARAMS=true` 并重启。流式和非流式响应都会通过 `X-DialX-Ignored-Parameters` 响应头列出已忽略字段；请求日志列表和详情 API 的 `ignored_parameters` 数组保留同样记录。
+
+**兼容模式不会实施 `max_tokens` 输出限制，也不会生成 logprobs 或 token 用量。** 被忽略字段的值不会发送给 DialX；正文、角色和已支持的温度保持原样。其他未知字段、工具、图片和输出格式仍报错，错误信息会指出具体字段，不回显字段值。
 
 详细真实抓包、请求头、请求体、响应帧和鉴权字段见 [docs/protocol.md](docs/protocol.md)。
 上游不是 SSE，而是 NUL 分隔 JSON。测试回放数据来自右侧浏览器的真实调用，不是猜测协议。

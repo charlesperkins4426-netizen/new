@@ -70,7 +70,10 @@ class RequestLogs:
                 id TEXT PRIMARY KEY, started_at TEXT NOT NULL, account_id TEXT,
                 model TEXT, status TEXT NOT NULL, ttft_ms REAL, duration_ms REAL,
                 error TEXT, code TEXT, messages TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
-                reasoning_content TEXT NOT NULL DEFAULT '')""")
+                reasoning_content TEXT NOT NULL DEFAULT '',
+                ignored_parameters TEXT NOT NULL DEFAULT '[]')""")
+            if "ignored_parameters" not in {row["name"] for row in db.execute("PRAGMA table_info(requests)")}:
+                db.execute("ALTER TABLE requests ADD COLUMN ignored_parameters TEXT NOT NULL DEFAULT '[]'")
             db.execute("CREATE INDEX IF NOT EXISTS requests_time ON requests(started_at)")
             db.execute("""UPDATE requests SET status='interrupted', code='process_interrupted',
                 error='服务重启前请求没有正常结束。' WHERE status='running'""")
@@ -81,13 +84,14 @@ class RequestLogs:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=self.retention)).isoformat()
         db.execute("DELETE FROM requests WHERE started_at < ? AND status != 'running'", (cutoff,))
 
-    async def start(self, request_id: str, started_at: str, model: str | None, messages: list):
+    async def start(self, request_id: str, started_at: str, model: str | None, messages: list,
+                    ignored_parameters=()):
         safe_messages = json.dumps(self.redact(messages), ensure_ascii=False)
         def insert(db):
             self._prune(db)
             db.execute(
-                "INSERT INTO requests(id,started_at,model,status,messages) VALUES(?,?,?,'running',?)",
-                (request_id, started_at, self.redact(model), safe_messages),
+                "INSERT INTO requests(id,started_at,model,status,messages,ignored_parameters) VALUES(?,?,?,'running',?,?)",
+                (request_id, started_at, self.redact(model), safe_messages, json.dumps(list(ignored_parameters))),
             )
         await self._run(insert)
 
@@ -110,6 +114,8 @@ class RequestLogs:
     @staticmethod
     def _row(row, detail=False):
         data = dict(row)
+        if "ignored_parameters" in data:
+            data["ignored_parameters"] = json.loads(data["ignored_parameters"])
         if detail:
             data["messages"] = json.loads(data["messages"])
         return data
@@ -125,7 +131,7 @@ class RequestLogs:
             self._prune(db)
             count = db.execute("SELECT count(*) FROM requests" + clause, params).fetchone()[0]
             rows = db.execute(
-                "SELECT id,started_at,account_id,model,status,ttft_ms,duration_ms,error,code FROM requests"
+                "SELECT id,started_at,account_id,model,status,ttft_ms,duration_ms,error,code,ignored_parameters FROM requests"
                 + clause + " ORDER BY started_at DESC LIMIT ? OFFSET ?", [*params, limit, offset],
             )
             return {"data": [self._row(r) for r in rows], "total": count}

@@ -36,6 +36,7 @@ class Settings:
     default_model: str = ""
     model_cache_ttl: int = 3600
     upstream_timeout: float = 1800
+    ignore_unsupported_params: bool = False
     connect_timeout: float = 15
     cooldown_seconds: int = 60
     account_wait_seconds: float = 2
@@ -49,6 +50,7 @@ class Settings:
 _DEFAULTS = {
     "HOST": "127.0.0.1", "PORT": "8000", "API_TOKEN": "123456", "DEFAULT_MODEL": "",
     "MODEL_CACHE_TTL": "3600", "UPSTREAM_TIMEOUT": "1800", "CONNECT_TIMEOUT": "15",
+    "IGNORE_UNSUPPORTED_PARAMS": "false",
     "COOLDOWN_SECONDS": "60", "ACCOUNT_WAIT_SECONDS": "2", "LOG_RETENTION_DAYS": "7",
     "MAX_FRAME_BYTES": "2097152", "MAX_RESPONSE_BYTES": "16777216", "DATA_DIR": "data",
     "DIALX_ENABLED_TOOLSETS": "[]", "DIALX_COOKIES": "", "DIALX_ACCOUNTS": "[]",
@@ -156,10 +158,14 @@ def _settings(values: dict[str, str], parent: Path) -> Settings:
     response = number("MAX_RESPONSE_BYTES", 1)
     if response < frame:
         raise _invalid("MAX_RESPONSE_BYTES 不能小于 MAX_FRAME_BYTES。")
+    compatibility = values["IGNORE_UNSUPPORTED_PARAMS"].strip().lower()
+    if compatibility not in {"true", "false"}:
+        raise _invalid("IGNORE_UNSUPPORTED_PARAMS 必须是 true 或 false。")
     return Settings(
         host=values["HOST"], port=port, api_token=token, default_model=values["DEFAULT_MODEL"],
         model_cache_ttl=number("MODEL_CACHE_TTL", 0),
         upstream_timeout=number("UPSTREAM_TIMEOUT", 0.001, integer=False),
+        ignore_unsupported_params=compatibility == "true",
         connect_timeout=number("CONNECT_TIMEOUT", 0.001, integer=False),
         cooldown_seconds=number("COOLDOWN_SECONDS", 0),
         account_wait_seconds=number("ACCOUNT_WAIT_SECONDS", 0, integer=False),

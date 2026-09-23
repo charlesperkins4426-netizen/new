@@ -77,7 +77,29 @@ class DeleteLogs(StrictBody):
     all: bool = False
 
 
-async def read_chat(request: Request) -> ChatRequest:
+IGNORABLE_PARAMETERS = ("max_tokens", "presence_penalty", "frequency_penalty", "top_logprobs")
+
+
+def validation_message(error: ValidationError) -> str:
+    hints = {
+        "extra_forbidden": "不支持此字段", "missing": "缺少必填字段",
+        "string_type": "必须为字符串", "bool_type": "必须为布尔值",
+        "float_type": "必须为数值", "finite_number": "必须为有限数值",
+        "literal_error": "角色仅支持 system、user、assistant",
+        "model_type": "必须为 JSON 对象", "list_type": "必须为数组",
+        "too_short": "内容或数量不足", "too_long": "长度或数量超过限制",
+    }
+    details = []
+    for item in error.errors(include_input=False, include_context=False, include_url=False)[:4]:
+        # Include bounded field locations, never rejected values or raw validator messages.
+        parts = [str(part) if isinstance(part, int) or (
+            isinstance(part, str) and part.isascii() and part.isidentifier() and len(part) <= 64
+        ) else "未知字段" for part in item["loc"]]
+        details.append(f"{'.'.join(parts) or '请求体'}：{hints.get(item['type'], '类型或取值无效')}")
+    return "请求参数无效。" + "；".join(details) + "。"
+
+
+async def read_chat(request: Request, *, ignore_unsupported_params=False) -> tuple[ChatRequest, list[str]]:
     if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
         raise GatewayError(415, "json_required", "请使用 Content-Type: application/json。")
     body = bytearray()
@@ -92,10 +114,15 @@ async def read_chat(request: Request) -> ChatRequest:
         value = json.loads(body)
     except (ValueError, UnicodeError):
         raise GatewayError(400, "invalid_json", "请求不是有效的 JSON。") from None
+    ignored = []
+    if ignore_unsupported_params and isinstance(value, dict):
+        ignored = [name for name in IGNORABLE_PARAMETERS if name in value]
+        for name in ignored:
+            del value[name]
     try:
-        return ChatRequest.model_validate(value)
-    except ValidationError:
-        raise GatewayError(400, "unsupported_request", "仅支持文本 messages、model、stream 和 temperature；请检查参数。") from None
+        return ChatRequest.model_validate(value), ignored
+    except ValidationError as error:
+        raise GatewayError(400, "unsupported_request", validation_message(error)) from None
 
 
 def create_app(env_path: str | Path | None = None, *, transport: httpx.AsyncBaseTransport | None = None):
@@ -128,6 +155,8 @@ def create_app(env_path: str | Path | None = None, *, transport: httpx.AsyncBase
             if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
                 return JSONResponse(GatewayError(415, "json_required", "管理操作必须使用 JSON。").payload(), status_code=415)
         response = await call_next(request)
+        if ignored := getattr(request.state, "ignored_parameters", None):
+            response.headers["X-DialX-Ignored-Parameters"] = ", ".join(ignored)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -271,6 +300,7 @@ def create_app(env_path: str | Path | None = None, *, transport: httpx.AsyncBase
         finished = False
         upstream = None
         data: dict = {}
+        ignored_parameters: list[str] = []
         request_secrets = config.secret_values()
 
         async def finish(status="success", error: GatewayError | None = None):
@@ -306,7 +336,7 @@ def create_app(env_path: str | Path | None = None, *, transport: httpx.AsyncBase
 
         async def start_log(model, messages):
             nonlocal logged
-            insertion = asyncio.create_task(logs.start(request_id, started_at, model, messages))
+            insertion = asyncio.create_task(logs.start(request_id, started_at, model, messages, ignored_parameters))
             try:
                 await settle(insertion)
             finally:
@@ -324,7 +354,10 @@ def create_app(env_path: str | Path | None = None, *, transport: httpx.AsyncBase
 
         try:
             authorize(request)
-            body = await read_chat(request)
+            body, ignored_parameters = await read_chat(
+                request, ignore_unsupported_params=config.settings.ignore_unsupported_params,
+            )
+            request.state.ignored_parameters = ignored_parameters
             data = body.model_dump(exclude_none=True)
             context = await while_connected(request, prepare(data))
         except asyncio.CancelledError:
