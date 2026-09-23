@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 
@@ -81,6 +82,31 @@ async def test_no_warning_when_no_fields_were_ignored(tmp_path):
         assert response.status_code == 200
         assert "X-DialX-Ignored-Parameters" not in response.headers
         assert (await app.state.logs.listing())["data"][0]["ignored_parameters"] == []
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_warning_metadata_is_isolated_between_requests(tmp_path, overlap):
+    async with running(tmp_path, Upstream()) as (app, client):
+        app.state.config._transaction(lambda values, accounts, disabled: values.update(
+            IGNORE_UNSUPPORTED_PARAMS="true", ACCOUNT_WAIT_SECONDS="1",
+        ))
+        fields = [{"max_tokens": 1}, {"frequency_penalty": 0, "top_logprobs": 0}, {}]
+        async def send(extra):
+            return await client.post("/v1/chat/completions", headers=HEADERS, json={**payload(), **extra})
+        if overlap:
+            responses = await asyncio.gather(*(send(extra) for extra in fields))
+        else:
+            responses = [await send(extra) for extra in fields]
+        for response, extra in zip(responses, fields, strict=True):
+            assert response.status_code == 200, response.text
+            expected = [name for name in IGNORABLE_PARAMETERS if name in extra]
+            header = response.headers.get("X-DialX-Ignored-Parameters")
+            assert header == (", ".join(expected) if expected else None)
+            detail = await app.state.logs.detail(response.json()["id"])
+            assert detail["ignored_parameters"] == expected
+        unauthorized = await client.post("/v1/chat/completions", json=compatible_payload())
+        assert unauthorized.status_code == 401
+        assert "X-DialX-Ignored-Parameters" not in unauthorized.headers
 
 
 async def test_warning_survives_upstream_error_and_is_logged(tmp_path):
