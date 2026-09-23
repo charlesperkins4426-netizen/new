@@ -77,8 +77,7 @@ class DialX:
         self.pool = pool
         self.cache: dict[str, dict] = {}
         self.refresh_lock = asyncio.Lock()
-        self.last_error: str | None = None
-        self.last_failure: GatewayError | None = None
+        self.refresh_failures: dict[str, tuple[str, GatewayError]] = {}
         self.refresh_epoch = 0
 
     @staticmethod
@@ -90,13 +89,14 @@ class DialX:
             raise GatewayError(502, "invalid_models", "上游模型目录格式错误。")
         return data
 
-    def failure(self, exc: Exception, account_id: str, model_id: str | None = None) -> GatewayError:
+    def failure(self, exc: Exception, account_id: str, model_id: str | None = None,
+                *, generation: str | None = None) -> GatewayError:
         error = transport_error(exc)
         error.account_id = account_id
         specific = model_id if error.code in {"upstream_forbidden", "upstream_rate_limited", "upstream_rejected"} else None
-        if error.status != 503 or error.code not in {"accounts_busy", "all_cooling", "all_disabled"}:
+        if generation is not None and error.status in {429, 502, 504}:
             self.pool.mark_failure(account_id, error.code, error.message,
-                                   retry_after=error.retry_after, model_id=specific)
+                                   generation=generation, retry_after=error.retry_after, model_id=specific)
         return error
 
     async def refresh(self, force=False):
@@ -105,18 +105,22 @@ class DialX:
             force = force and observed_epoch == self.refresh_epoch
             enabled = self.pool.enabled_ids()
             for key in list(self.cache):
-                if key not in enabled:
+                if key not in enabled or not self.pool.is_current(key, self.cache[key]["generation"]):
                     del self.cache[key]
-            errors = []
-            self.last_failure = None
+            for key, (generation, _) in list(self.refresh_failures.items()):
+                if key not in enabled or not self.pool.is_current(key, generation):
+                    del self.refresh_failures[key]
+            generations = {record["id"]: record["generation"] for record in self.config.accounts()}
             attempted = False
             for account_id in sorted(enabled):
                 cached = self.cache.get(account_id)
                 if not force and cached and time.monotonic() - cached["time"] < self.config.settings.model_cache_ttl:
                     continue
+                generation = None
                 try:
                     attempted = True
                     async with self.pool.lease(account_id=account_id) as lease:
+                        generation = lease.generation
                         models = self._validate_models(await get_json(lease.client, "/api/models"))
                         tools, tool_error = [], None
                         try:
@@ -127,22 +131,31 @@ class DialX:
                         except (GatewayError, httpx.HTTPError) as exc:
                             tool_error = transport_error(exc).message
                     # Do not re-add cache entries for accounts deleted during the fetch.
-                    if account_id in self.pool.enabled_ids():
+                    if account_id in self.pool.enabled_ids() and self.pool.is_current(account_id, generation):
                         self.cache[account_id] = {"models": models, "tools": tools, "tool_error": tool_error,
-                                                  "time": time.monotonic(), "updated_at": utcnow()}
-                    self.pool.mark_success(account_id)
+                                                  "time": time.monotonic(), "updated_at": utcnow(), "generation": generation}
+                        self.refresh_failures.pop(account_id, None)
+                    self.pool.mark_success(account_id, generation=generation)
                 except (GatewayError, httpx.HTTPError) as exc:
-                    error = self.failure(exc, account_id)
-                    self.last_failure = error
-                    errors.append(f"{account_id}: {error.message}")
-            self.last_error = "；".join(errors) or None
+                    error = self.failure(exc, account_id, generation=generation)
+                    observed = generation or generations.get(account_id)
+                    if observed and self.pool.is_current(account_id, observed):
+                        if generation is not None or account_id not in self.refresh_failures:
+                            self.refresh_failures[account_id] = (observed, GatewayError(
+                                error.status, error.code, error.message, account_id=account_id, retry_after=error.retry_after))
             if attempted:
                 self.refresh_epoch += 1
         return self.model_view()
 
     def _active_entries(self):
         enabled = self.pool.enabled_ids()
-        return [entry for account, entry in self.cache.items() if account in enabled]
+        return [entry for account, entry in self.cache.items()
+                if account in enabled and self.pool.is_current(account, entry["generation"])]
+
+    def _current_failures(self):
+        enabled = self.pool.enabled_ids()
+        return [error for account, (generation, error) in self.refresh_failures.items()
+                if account in enabled and self.pool.is_current(account, generation)]
 
     @staticmethod
     def _chat_model(model):
@@ -150,44 +163,51 @@ class DialX:
 
     def model_view(self):
         entries = self._active_entries()
+        failures = self._current_failures()
         all_models = {m["id"]: m for entry in entries for m in entry["models"]}
-        models = [m for m in all_models.values() if self._chat_model(m)]
+        chat_models = {m["id"]: m for entry in entries for m in entry["models"] if self._chat_model(m)}
+        models = list(chat_models.values())
         models.sort(key=lambda m: m["id"])
         default = self.config.settings.default_model
         if not default and models:
             default = next((m["id"] for m in models if m.get("isDefault")), models[0]["id"])
         return {"data": models, "default_model": default or None,
                 "updated_at": max((e["updated_at"] for e in entries), default=None),
-                "stale": bool(entries) and any(time.monotonic() - e["time"] >= self.config.settings.model_cache_ttl for e in entries),
-                "error": self.last_error, "total_count": len(all_models),
+                "stale": bool(entries) and (bool(failures) or any(time.monotonic() - e["time"] >= self.config.settings.model_cache_ttl for e in entries)),
+                "error": "；".join(f"{e.account_id}: {e.message}" for e in failures) or None, "total_count": len(all_models),
                 "applications_count": sum(m.get("type") == "application" for m in all_models.values())}
 
     def tools_view(self):
         entries = self._active_entries()
+        failures = self._current_failures()
         tools = {t["id"]: t for entry in entries for t in entry["tools"]}
         return {"data": [{"id": t["id"], "name": t.get("display_name", t["id"]),
                           "description": t.get("description", ""), "enabled": False, "available": False,
                           "reason": "原生模型的工具绑定尚未验证，不能开启。"} for t in tools.values()],
                 "updated_at": max((e["updated_at"] for e in entries), default=None),
-                "error": self.last_error or next((e["tool_error"] for e in entries if e["tool_error"]), None)}
+                "error": "；".join(f"{e.account_id}: {e.message}" for e in failures)
+                or next((e["tool_error"] for e in entries if e["tool_error"]), None)}
 
     async def require_models(self):
         view = await self.refresh()
         if view["data"]:
             return view
-        if self.pool.enabled_ids() and self.last_failure:
-            raise GatewayError(503, "models_unavailable", "模型目录不可用：" + self.last_failure.message,
-                               account_id=self.last_failure.account_id)
+        failures = self._current_failures()
+        if failures:
+            raise GatewayError(503, "models_unavailable", "模型目录不可用：" + failures[0].message,
+                               account_id=failures[0].account_id)
         # The pool supplies distinct no-account / disabled / cooldown / busy errors.
         async with self.pool.lease():
             raise GatewayError(503, "models_unavailable", "没有可用模型目录，请检查账号或刷新模型。")
 
     async def check_account(self, account_id: str, requested_model: str | None = None):
+        generation = None
         result = {"id": account_id, "checked_at": utcnow(), "check_status": "error",
                   "session_expires": None, "limits": None, "model": requested_model,
                   "balance": None, "subscription": None, "trial_expires": None, "error": None}
         try:
             async with self.pool.lease(account_id=account_id, for_check=True) as lease:
+                generation = lease.generation
                 session = await get_json(lease.client, "/api/auth/session")
                 if not isinstance(session, dict) or not session.get("user"):
                     raise GatewayError(502, "invalid_cookie", "Cookie 已失效，请重新登录 DialX 并复制完整 Cookie。")
@@ -209,26 +229,35 @@ class DialX:
                         result["error"] = transport_error(exc).message
                 else:
                     result["error"] = "会话有效，但没有所选模型的配额信息。"
-            self.pool.mark_success(account_id)
+            self.pool.mark_success(account_id, generation=generation)
         except (GatewayError, httpx.HTTPError) as exc:
-            error = self.failure(exc, account_id, requested_model)
+            error = self.failure(exc, account_id, requested_model, generation=generation)
             result["check_status"] = "invalid" if error.code == "invalid_cookie" else "error"
             result["error"] = error.message
-            self.pool.record_check(account_id, result)
+            if generation is not None:
+                self.pool.record_check(account_id, result, generation=generation)
             raise error from None
-        self.pool.record_check(account_id, result)
+        self.pool.record_check(account_id, result, generation=generation)
         return result
 
     @asynccontextmanager
-    async def completion(self, request: dict):
+    async def completion(self, request: dict, on_selected=None):
         view = await self.require_models()
         model_id = request.get("model") or view["default_model"]
         if not any(m["id"] == model_id for m in view["data"]):
             raise GatewayError(404, "model_not_found", "所选模型不在当前账号的模型目录中。")
         eligible = {account for account, entry in self.cache.items()
-                    if any(m["id"] == model_id and self._chat_model(m) for m in entry["models"])}
+                    if self.pool.is_current(account, entry["generation"])
+                    and any(m["id"] == model_id and self._chat_model(m) for m in entry["models"])}
         async with self.pool.lease(eligible_ids=eligible, model_id=model_id) as lease:
-            model = next(m for m in self.cache[lease.account_id]["models"] if m["id"] == model_id)
+            entry = self.cache.get(lease.account_id)
+            if entry is None or entry["generation"] != lease.generation:
+                raise GatewayError(503, "catalog_changed", "账号已重新导入，请刷新模型后重试。", account_id=lease.account_id)
+            model = next((m for m in entry["models"] if m["id"] == model_id and self._chat_model(m)), None)
+            if model is None:
+                raise GatewayError(503, "model_unavailable", "账号的模型目录已变化，请刷新模型后重试。", account_id=lease.account_id)
+            if on_selected is not None:
+                await on_selected(lease.account_id, model_id)
             body = {"model": model, "messages": request["messages"],
                     "id": f"conversations/local/{model_id}__gateway-{uuid.uuid4().hex}",
                     "reference": uuid.uuid4().hex[:21], "prompt": "",
@@ -245,6 +274,6 @@ class DialX:
                     initial = channels.feed(first)
                     yield {"account_id": lease.account_id, "model": model_id, "stream": stream,
                            "first": first, "initial": initial, "channels": channels}
-                self.pool.mark_success(lease.account_id, model_id=model_id)
+                self.pool.mark_success(lease.account_id, model_id=model_id, generation=lease.generation)
             except (GatewayError, httpx.HTTPError) as exc:
-                raise self.failure(exc, lease.account_id, model_id) from None
+                raise self.failure(exc, lease.account_id, model_id, generation=lease.generation) from None

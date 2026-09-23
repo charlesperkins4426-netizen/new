@@ -1,3 +1,4 @@
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -262,7 +263,7 @@ async def test_model_rate_limit_does_not_disable_other_models(tmp_path):
         assert response.status_code == 503
 
 
-async def test_failure_after_first_frame_closes_response_and_finishes_log(tmp_path, monkeypatch):
+async def test_binding_failure_releases_account_and_finishes_log(tmp_path, monkeypatch):
     from gateway.errors import GatewayError
     upstream = Upstream()
     async with running(tmp_path, upstream) as (app, client):
@@ -279,6 +280,36 @@ async def test_failure_after_first_frame_closes_response_and_finishes_log(tmp_pa
         monkeypatch.setattr(app.state.logs, "bind", fail_once)
         response = await client.post("/v1/chat/completions", headers=HEADERS, json=payload())
         assert response.status_code == 507
+        assert upstream.streams == []
         assert all(s.closed for s in upstream.streams)
         assert not any(a["busy"] for a in app.state.pool.snapshot())
         assert (await app.state.logs.listing())["data"][0]["status"] == "failed"
+
+
+async def test_late_inflight_failure_does_not_poison_reimported_account(tmp_path):
+    upstream = Upstream()
+    started, release = asyncio.Event(), asyncio.Event()
+    async def handler(request):
+        if request.url.path == "/api/chat":
+            started.set()
+            await release.wait()
+            raise httpx.ReadTimeout("old request failed")
+        return await upstream(request)
+    async with running(tmp_path, handler) as (app, client):
+        account_id = (await client.get("/api/admin/accounts")).json()["data"][0]["id"]
+        old_request = asyncio.create_task(client.post("/v1/chat/completions", headers=HEADERS, json=payload()))
+        await asyncio.wait_for(started.wait(), 2)
+        try:
+            await client.post("/api/admin/accounts/delete", json={"ids": [account_id]})
+            imported = await client.post("/api/admin/accounts", json={"cookies": "__Secure-next-auth.session-token=test-cookie"})
+            assert imported.json()["ids"] == [account_id]
+            check = await client.post(f"/api/admin/accounts/{account_id}/check", json={})
+            assert check.status_code == 200
+            assert app.state.dialx.model_view()["data"] == []  # old-generation cache is hidden
+        finally:
+            release.set()
+        assert (await old_request).status_code == 504
+        row = (await client.get("/api/admin/accounts")).json()["data"][0]
+        assert row["status"] == "ready" and row["check_status"] == "valid"
+        assert row["cooldown_until"] is None
+        assert (await client.get("/v1/models", headers=HEADERS)).status_code == 200

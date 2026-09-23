@@ -17,11 +17,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.requests import ClientDisconnect
 
 from gateway.accounts import AccountPool
 from gateway.config import ConfigStore
 from gateway.errors import GatewayError
 from gateway.logs import RequestLogs, utcnow
+from gateway.lifecycle import settle, while_connected
 from gateway.protocol import sse
 from gateway.service import DialX, transport_error
 
@@ -79,10 +81,13 @@ async def read_chat(request: Request) -> ChatRequest:
     if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
         raise GatewayError(415, "json_required", "请使用 Content-Type: application/json。")
     body = bytearray()
-    async for chunk in request.stream():
-        body.extend(chunk)
-        if len(body) > 1024 * 1024:
-            raise GatewayError(413, "request_too_large", "请求超过 1 MiB 限制。")
+    try:
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > 1024 * 1024:
+                raise GatewayError(413, "request_too_large", "请求超过 1 MiB 限制。")
+    except ClientDisconnect:
+        raise GatewayError(499, "client_cancelled", "客户端在上传请求时断开。") from None
     try:
         value = json.loads(body)
     except (ValueError, UnicodeError):
@@ -265,7 +270,7 @@ def create_app(env_path: str | Path | None = None, *, transport: httpx.AsyncBase
         logged = False
         finished = False
         upstream = None
-        upstream_entered = False
+        data: dict = {}
         request_secrets = config.secret_values()
 
         async def finish(status="success", error: GatewayError | None = None):
@@ -279,35 +284,59 @@ def create_app(env_path: str | Path | None = None, *, transport: httpx.AsyncBase
                               extra_secrets=request_secrets)
             finished = True
 
+        async def close_upstream(error=None):
+            nonlocal upstream
+            if upstream is not None:
+                active, upstream = upstream, None
+                if error is None:
+                    await active.__aexit__(None, None, None)
+                else:
+                    await active.__aexit__(type(error), error, error.__traceback__)
+
+        async def close_after_error(error):
+            try:
+                await close_upstream(error)
+            except Exception as closing_error:
+                return transport_error(closing_error)
+            return error
+
+        async def cancel_request():
+            error = await close_after_error(GatewayError(499, "client_cancelled", "客户端停止接收回答。"))
+            await finish("cancelled" if error.code == "client_cancelled" else "failed", error)
+
+        async def start_log(model, messages):
+            nonlocal logged
+            insertion = asyncio.create_task(logs.start(request_id, started_at, model, messages))
+            try:
+                await settle(insertion)
+            finally:
+                if insertion.done() and not insertion.cancelled() and insertion.exception() is None:
+                    logged = True
+
+        async def prepare(data):
+            nonlocal upstream, ttft
+            await start_log(body.model, data["messages"])
+            manager = dialx.completion(data, on_selected=lambda account_id, model_id: logs.bind(request_id, account_id, model_id))
+            context = await manager.__aenter__()
+            upstream = manager
+            ttft = round((time.monotonic() - began) * 1000, 2)
+            return context
+
         try:
             authorize(request)
             body = await read_chat(request)
             data = body.model_dump(exclude_none=True)
-            await logs.start(request_id, started_at, body.model, data["messages"])
-            logged = True
-            upstream = dialx.completion(data)
-            context = await upstream.__aenter__()
-            upstream_entered = True
-            ttft = round((time.monotonic() - began) * 1000, 2)
-            await logs.bind(request_id, context["account_id"], context["model"])
+            context = await while_connected(request, prepare(data))
         except asyncio.CancelledError:
-            if upstream_entered:
-                await asyncio.shield(upstream.__aexit__(None, None, None))
-            await asyncio.shield(finish("cancelled", GatewayError(499, "client_cancelled", "客户端停止接收回答。")))
+            await settle(asyncio.create_task(cancel_request()))
             raise
         except Exception as exc:
-            error = transport_error(exc)
-            if upstream_entered:
-                try:
-                    await upstream.__aexit__(type(error), error, error.__traceback__)
-                except GatewayError as closing_error:
-                    error = closing_error
+            error = await close_after_error(transport_error(exc))
             if not logged:
-                await logs.start(request_id, started_at, None, [])
-                logged = True
+                await start_log(None, [])
             if error.account_id:
-                await logs.bind(request_id, error.account_id, data.get("model", "") if "data" in locals() else "")
-            await finish("failed", error)
+                await logs.bind(request_id, error.account_id, data.get("model", ""))
+            await finish("cancelled" if error.code == "client_cancelled" else "failed", error)
             raise error from None
 
         def chunk(delta=None, stop=False):
@@ -328,15 +357,6 @@ def create_app(env_path: str | Path | None = None, *, transport: httpx.AsyncBase
                     for kind, text in collect(context["channels"].feed(frame)):
                         yield kind, text
 
-        async def close_upstream(error=None):
-            nonlocal upstream
-            if upstream is not None:
-                active, upstream = upstream, None
-                if error is None:
-                    await active.__aexit__(None, None, None)
-                else:
-                    await active.__aexit__(type(error), error, error.__traceback__)
-
         async def streaming():
             try:
                 yield sse(chunk({"role": "assistant"}))
@@ -346,47 +366,43 @@ def create_app(env_path: str | Path | None = None, *, transport: httpx.AsyncBase
                 await finish()
                 yield sse(chunk(stop=True))
                 yield sse("[DONE]")
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, GeneratorExit):
                 try:
-                    await asyncio.shield(close_upstream())
-                    await asyncio.shield(finish("cancelled", GatewayError(499, "client_cancelled", "客户端停止接收回答。")))
+                    await settle(asyncio.create_task(cancel_request()))
                 finally:
                     raise
             except Exception as exc:
                 error = transport_error(exc)
                 error.account_id = context["account_id"]
-                try:
-                    await close_upstream(error)
-                except GatewayError as closing_error:
-                    error = closing_error
+                error = await close_after_error(error)
                 await finish("failed", error)
                 yield sse(logs.redact(error.payload()))
             finally:
-                if upstream is not None:
-                    await asyncio.shield(close_upstream())
-                if not finished:
-                    await asyncio.shield(finish("interrupted", GatewayError(502, "stream_interrupted", "回答流未正常结束。")))
+                if upstream is not None or not finished:
+                    async def finalize_interrupted():
+                        error = await close_after_error(GatewayError(502, "stream_interrupted", "回答流未正常结束。"))
+                        await finish("interrupted", error)
+                    await settle(asyncio.create_task(finalize_interrupted()))
 
         if body.stream:
             return StreamingResponse(streaming(), media_type="text/event-stream",
                                      headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
-        try:
+        async def consume_nonstream():
             async for _ in events():
                 pass
             await close_upstream()
             await finish()
+
+        try:
+            await while_connected(request, consume_nonstream())
         except asyncio.CancelledError:
-            await asyncio.shield(close_upstream())
-            await asyncio.shield(finish("cancelled", GatewayError(499, "client_cancelled", "客户端停止接收回答。")))
+            await settle(asyncio.create_task(cancel_request()))
             raise
         except Exception as exc:
             error = transport_error(exc)
             error.account_id = context["account_id"]
-            try:
-                await close_upstream(error)
-            except GatewayError as closing_error:
-                error = closing_error
-            await finish("failed", error)
+            error = await close_after_error(error)
+            await finish("cancelled" if error.code == "client_cancelled" else "failed", error)
             raise error from None
         return {"id": request_id, "object": "chat.completion", "created": created, "model": context["model"],
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "".join(content),

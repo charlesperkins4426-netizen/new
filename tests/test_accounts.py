@@ -31,6 +31,10 @@ async def pool(config):
     await pool.close()
 
 
+def current_generation(pool, account_id):
+    return next(record["generation"] for record in pool.config.accounts() if record["id"] == account_id)
+
+
 async def assert_lease_error(pool, code, **kwargs):
     with pytest.raises(GatewayError) as caught:
         async with pool.lease(**kwargs):
@@ -47,11 +51,11 @@ async def test_empty_disabled_cooling_busy_and_unavailable_are_distinct(pool):
     await pool.set_enabled(account_id, True)
     assert pool.enabled_ids() == {account_id}
     await assert_lease_error(pool, "model_unavailable", eligible_ids=set())
-    pool.mark_failure(account_id, "upstream_network", "网络故障", retry_after=120)
+    pool.mark_failure(account_id, "upstream_network", "网络故障", retry_after=120, generation=current_generation(pool, account_id))
     error = await assert_lease_error(pool, "all_cooling")
     assert error.retry_after == 120
     assert pool.snapshot()[0]["status"] == "cooling"
-    pool.mark_success(account_id)
+    pool.mark_success(account_id, generation=current_generation(pool, account_id))
     async with pool.lease():
         started = time.monotonic()
         error = await assert_lease_error(pool, "accounts_busy")
@@ -111,9 +115,9 @@ async def test_waiting_lease_acquires_after_release(pool):
 
 async def test_free_check_can_lease_disabled_and_cooling_without_enabling(pool):
     account_id = (await pool.add_accounts(COOKIE, enabled=False))["ids"][0]
-    pool.mark_failure(account_id, "upstream_auth", "会话无效")
+    pool.mark_failure(account_id, "upstream_auth", "会话无效", generation=current_generation(pool, account_id))
     async with pool.lease(account_id, for_check=True):
-        pool.mark_success(account_id)
+        pool.mark_success(account_id, generation=current_generation(pool, account_id))
     assert pool.enabled_ids() == set()
     assert pool.snapshot()[0]["status"] == "disabled"
     await assert_lease_error(pool, "all_disabled")
@@ -122,12 +126,12 @@ async def test_free_check_can_lease_disabled_and_cooling_without_enabling(pool):
 
 async def test_model_cooldown_does_not_disable_other_models(pool):
     account_id = (await pool.add_accounts(COOKIE))["ids"][0]
-    pool.mark_failure(account_id, "upstream_quota", "该模型配额不足", model_id="limited")
+    pool.mark_failure(account_id, "upstream_quota", "该模型配额不足", model_id="limited", generation=current_generation(pool, account_id))
     await assert_lease_error(pool, "all_cooling", model_id="limited")
     async with pool.lease(model_id="other"):
-        pool.mark_success(account_id, model_id="other")
+        pool.mark_success(account_id, model_id="other", generation=current_generation(pool, account_id))
     await assert_lease_error(pool, "all_cooling", model_id="limited")
-    pool.mark_success(account_id, model_id="limited")
+    pool.mark_success(account_id, model_id="limited", generation=current_generation(pool, account_id))
     async with pool.lease(model_id="limited"):
         pass
 
@@ -189,7 +193,7 @@ async def test_expired_session_cookie_pauses_account_without_persisting_empty(co
         await assert_lease_error(pool, "all_cooling")
         async with pool.lease(account_id, for_check=True) as lease:
             lease.client.cookies.set(SESSION_COOKIE, "repaired-value", domain="chat.dialx.ai", path="/")
-            pool.mark_success(account_id)
+            pool.mark_success(account_id, generation=current_generation(pool, account_id))
         assert pool.snapshot()[0]["status"] == "ready"
     finally:
         await pool.close()
@@ -254,11 +258,11 @@ async def test_persistence_failure_pauses_account_and_is_not_swallowed(pool, con
     assert config.accounts()[0]["cookie"] == COOKIE
     assert pool.snapshot()[0]["status"] == "error"
     assert not pool.snapshot()[0]["busy"]
-    pool.mark_success(account_id)
+    pool.mark_success(account_id, generation=current_generation(pool, account_id))
     assert pool.snapshot()[0]["status"] == "error"  # health success cannot hide an unsaved jar
     await assert_lease_error(pool, "all_cooling")
     async with pool.lease(account_id, for_check=True):
-        pool.mark_success(account_id)
+        pool.mark_success(account_id, generation=current_generation(pool, account_id))
     assert config.accounts()[0]["cookie"] == f"{SESSION_COOKIE}=rotated-value"
     assert pool.snapshot()[0]["status"] == "ready"
     assert pool.snapshot()[0]["last_error"] is None
@@ -383,13 +387,13 @@ async def test_snapshot_and_record_check_are_copies_and_do_not_expose_secrets(po
         "check_status": "valid", "limits": {"dayTokenStats": {"total": 100, "used": 4}},
         "error": None,
     }
-    pool.record_check(account_id, result)
+    pool.record_check(account_id, result, generation=current_generation(pool, account_id))
     result["limits"]["dayTokenStats"]["used"] = 999
     row = pool.snapshot()[0]
     assert row["limits"]["dayTokenStats"]["used"] == 4
     row["limits"]["dayTokenStats"]["used"] = 888
     assert pool.snapshot()[0]["limits"]["dayTokenStats"]["used"] == 4
-    pool.mark_failure(account_id, "upstream_auth", f"denied {COOKIE} 123456")
+    pool.mark_failure(account_id, "upstream_auth", f"denied {COOKIE} 123456", generation=current_generation(pool, account_id))
     serialized = json.dumps(pool.snapshot())
     assert "synthetic-account-one" not in serialized
     assert "123456" not in serialized
@@ -421,7 +425,7 @@ async def test_cookie_jars_do_not_cross_accounts_and_never_follow_redirects(conf
 ])
 async def test_credential_network_failures_remain_global_with_model_hint(pool, code):
     account_id = (await pool.add_accounts(COOKIE))["ids"][0]
-    pool.mark_failure(account_id, code, "请求失败", model_id="specific")
+    pool.mark_failure(account_id, code, "请求失败", model_id="specific", generation=current_generation(pool, account_id))
     await assert_lease_error(pool, "all_cooling", model_id="other")
 
 
@@ -430,7 +434,7 @@ async def test_cooldown_expires_on_monotonic_time(pool, monkeypatch):
     account_id = (await pool.add_accounts(COOKIE))["ids"][0]
     clock = [1000.0]
     monkeypatch.setattr("gateway.accounts.time", SimpleNamespace(monotonic=lambda: clock[0]))
-    pool.mark_failure(account_id, "upstream_network", "请求失败")
+    pool.mark_failure(account_id, "upstream_network", "请求失败", generation=current_generation(pool, account_id))
     await assert_lease_error(pool, "all_cooling")
     clock[0] += 61
     assert pool.snapshot()[0]["status"] == "ready"
@@ -475,3 +479,112 @@ async def test_chunked_cookie_can_rotate_to_unchunked_session(config):
         assert config.accounts()[0]["cookie"] == f"{SESSION_COOKIE}=single-new-session"
     finally:
         await pool.close()
+
+
+@pytest.mark.parametrize("model_id", [None, "limited-model"])
+async def test_delayed_failure_cannot_cool_reimported_generation(pool, model_id):
+    account_id = (await pool.add_accounts(COOKIE))["ids"][0]
+    async with pool.lease(account_id) as old:
+        await pool.delete_accounts([account_id])
+        assert (await pool.add_accounts(COOKIE))["ids"] == [account_id]
+        async with pool.lease(account_id) as replacement:
+            assert replacement.generation != old.generation
+            pool.record_check(account_id, {
+                "checked_at": "2030-01-01T00:00:00Z", "check_status": "valid",
+                "session_expires": "2030-02-01T00:00:00Z",
+                "limits": {"dayTokenStats": {"total": 100, "used": 5}}, "error": None,
+            }, generation=replacement.generation)
+        before = pool.snapshot()[0]
+        code = "invalid_cookie" if model_id is None else "upstream_forbidden"
+        pool.mark_failure(account_id, code, "来自已删除账号的失败", generation=old.generation,
+                          model_id=model_id, retry_after=120)
+        assert pool.snapshot()[0] == before
+        async with pool.lease(account_id, model_id=model_id) as healthy:
+            assert healthy.generation == replacement.generation
+    assert old.client.is_closed
+
+
+@pytest.mark.parametrize("model_id", [None, "limited-model"])
+async def test_delayed_success_cannot_clear_replacement_failure(pool, model_id):
+    account_id = (await pool.add_accounts(COOKIE))["ids"][0]
+    async with pool.lease(account_id) as old:
+        await pool.delete_accounts([account_id])
+        assert (await pool.add_accounts(COOKIE))["ids"] == [account_id]
+        async with pool.lease(account_id) as replacement:
+            code = "upstream_connection" if model_id is None else "upstream_forbidden"
+            pool.mark_failure(account_id, code, "新代次自己的失败", generation=replacement.generation,
+                              model_id=model_id, retry_after=120)
+        pool.mark_success(account_id, generation=old.generation, model_id=model_id)
+        assert pool.snapshot()[0]["last_error"] == "新代次自己的失败"
+        error = await assert_lease_error(pool, "all_cooling", account_id=account_id, model_id=model_id)
+        assert error.retry_after == 120
+        # The matching generation can still clear its own failure.
+        pool.mark_success(account_id, generation=replacement.generation, model_id=model_id)
+        async with pool.lease(account_id, model_id=model_id):
+            pass
+
+
+@pytest.mark.parametrize("old_status", ["valid", "invalid"])
+async def test_delayed_check_preserves_replacement_expiry_limits_and_health(pool, old_status):
+    account_id = (await pool.add_accounts(COOKIE))["ids"][0]
+    async with pool.lease(account_id) as old:
+        await pool.delete_accounts([account_id])
+        assert (await pool.add_accounts(COOKIE))["ids"] == [account_id]
+        async with pool.lease(account_id) as replacement:
+            current_result = {
+                "checked_at": "2035-01-01T00:00:00Z", "check_status": "valid",
+                "session_expires": "2035-02-01T00:00:00Z",
+                "limits": {"dayTokenStats": {"total": 1000, "used": 700}}, "error": None,
+            }
+            pool.record_check(account_id, current_result, generation=replacement.generation)
+            pool.mark_failure(account_id, "upstream_connection", "新代次自己的网络故障",
+                              generation=replacement.generation)
+        pool.record_check(account_id, {
+            "checked_at": "2000-01-01T00:00:00Z", "check_status": old_status,
+            "session_expires": "2000-02-01T00:00:00Z",
+            "limits": {"dayTokenStats": {"total": 1, "used": 0}}, "error": "迟到的检查结果",
+        }, generation=old.generation)
+        row = pool.snapshot()[0]
+        assert row["check_status"] == current_result["check_status"]
+        assert row["last_checked"] == current_result["checked_at"]
+        assert row["session_expires"] == current_result["session_expires"]
+        assert row["limits"] == current_result["limits"]
+        assert row["last_error"] == "新代次自己的网络故障"
+        await assert_lease_error(pool, "all_cooling", account_id=account_id)
+
+
+async def test_is_current_tracks_generation_not_enabled_or_health(pool):
+    account_id = (await pool.add_accounts(COOKIE))["ids"][0]
+    async with pool.lease(account_id) as old:
+        assert pool.is_current(account_id, old.generation)
+        assert not pool.is_current(account_id, "incorrect-generation")
+        assert not pool.is_current("missing-account", old.generation)
+        await pool.set_enabled(account_id, False)
+        assert pool.is_current(account_id, old.generation)
+        pool.mark_failure(account_id, "invalid_cookie", "会话无效", generation=old.generation)
+        assert pool.is_current(account_id, old.generation)
+        await pool.delete_accounts([account_id])
+        assert not pool.is_current(account_id, old.generation)
+        assert (await pool.add_accounts(COOKIE, enabled=False))["ids"] == [account_id]
+        async with pool.lease(account_id, for_check=True) as replacement:
+            assert pool.is_current(account_id, replacement.generation)
+            assert not pool.is_current(account_id, old.generation)
+
+
+@pytest.mark.parametrize("method", ["mark_failure", "mark_success", "record_check"])
+def test_callback_generation_is_required_keyword_only(method):
+    import inspect
+    parameter = inspect.signature(getattr(AccountPool, method)).parameters["generation"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+
+
+async def test_deleted_account_ignores_all_delayed_callbacks(pool):
+    account_id = (await pool.add_accounts(COOKIE))["ids"][0]
+    async with pool.lease(account_id) as old:
+        await pool.delete_accounts([account_id])
+        pool.mark_failure(account_id, "invalid_cookie", "迟到的错误", generation=old.generation)
+        pool.mark_success(account_id, generation=old.generation)
+        pool.record_check(account_id, {"check_status": "valid"}, generation=old.generation)
+    assert pool.snapshot() == []
+    assert not pool.is_current(account_id, old.generation)

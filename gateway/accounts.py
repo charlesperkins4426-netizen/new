@@ -135,6 +135,12 @@ class AccountPool:
         with self._lock:
             return {state.account_id for state in self._states.values() if state.enabled}
 
+    def is_current(self, account_id: str, generation: str) -> bool:
+        """Check identity without conflating it with enabled or transient health state."""
+        with self._lock:
+            state = self._states.get(account_id)
+            return state is not None and state.generation == generation
+
     def snapshot(self) -> list[dict]:
         with self._lock:
             now = time.monotonic()
@@ -270,13 +276,13 @@ class AccountPool:
                 text = text.replace(secret, "[已隐藏]")
         return text[:500]
 
-    def mark_failure(self, account_id: str, code: str, message: str, *,
+    def mark_failure(self, account_id: str, code: str, message: str, *, generation: str,
                      retry_after: int | None = None, model_id: str | None = None) -> None:
         message = self._safe_message(message)
         duration = max(self.config.settings.cooldown_seconds, retry_after or 0)
         with self._lock:
             state = self._states.get(account_id)
-            if state is None:
+            if state is None or state.generation != generation:
                 return
             state.last_error = message
             until = time.monotonic() + duration
@@ -292,10 +298,11 @@ class AccountPool:
             if code in {"invalid_cookie", "upstream_auth", "invalid_session"}:
                 state.check_status = "invalid"
 
-    def mark_success(self, account_id: str, *, model_id: str | None = None) -> None:
+    def mark_success(self, account_id: str, *, generation: str,
+                     model_id: str | None = None) -> None:
         with self._lock:
             state = self._states.get(account_id)
-            if state is None:
+            if state is None or state.generation != generation:
                 return
             if model_id is not None:
                 state.model_cooldowns.pop(model_id, None)
@@ -304,11 +311,11 @@ class AccountPool:
             if not state.paused:
                 state.last_error = None
 
-    def record_check(self, account_id: str, result: dict) -> None:
+    def record_check(self, account_id: str, result: dict, *, generation: str) -> None:
         error = self._safe_message(result["error"]) if result.get("error") else None
         with self._lock:
             state = self._states.get(account_id)
-            if state is None:
+            if state is None or state.generation != generation:
                 return
             state.last_checked = result.get("checked_at")
             state.session_expires = result.get("session_expires")
