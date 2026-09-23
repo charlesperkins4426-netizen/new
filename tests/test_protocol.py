@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 
@@ -57,7 +58,9 @@ async def test_stage_completion_does_not_end_body_or_deduplicate_reasoning():
     (b'', 'incomplete_stream'), (b'{"content":"x"}\0', 'incomplete_stream'),
     (b'{}', 'incomplete_stream'), (b'{bad}\0', 'invalid_frame'),
     (b'{"content":"\xff"}\0', 'invalid_frame'), (b'[]\0', 'invalid_frame'),
-    (b'\0', 'invalid_frame'), (b'{}\0{}\0', 'invalid_terminator'),
+    (b'\0', 'invalid_frame'), (b'{}\0{"content":"late"}\0', 'incomplete_stream'),
+    (b'{}\0{"content":', 'incomplete_stream'), (b'{}\0{bad}\0', 'invalid_frame'),
+    (encode([{}, {"error": "secret-cookie"}]), 'upstream_stream_error'),
     (encode([{"content": ["wrong"]}, {}]), 'invalid_frame'),
     (encode([{"error": "secret-cookie"}]), 'upstream_stream_error'),
     (encode([{"custom_content": {"stages": [{"index": 0, "content": "unknown"}]}}, {}]), 'unknown_stage'),
@@ -74,6 +77,61 @@ async def test_size_limits():
         await parse([b'12345'], frame=4)
     with pytest.raises(GatewayError, match="回答"):
         await parse([encode([{"content": "long"}, {}])], response=4)
+
+
+async def test_intermediate_initial_and_consecutive_empty_frames_at_every_split():
+    values = [{}, {}, {"responseId": "long-answer"}, {"content": "开头🙂"}, {}, {},
+              {"content": "完整末尾"},
+              {"custom_content": {"state": {"claude_message_content": [{"text": "开头🙂完整末尾"}]}}}, {}, {}]
+    data = encode(values)
+    expected = {"content": "开头🙂完整末尾", "reasoning_content": ""}
+    for index in range(len(data) + 1):
+        assert await parse([data[:index], data[index:]]) == expected
+    assert await parse([bytes([byte]) for byte in data]) == expected
+    parsed = [frame async for frame in frames(chunks([data]), max_frame_bytes=10000, max_response_bytes=10000)]
+    assert parsed[-1] == {} and parsed.count({}) == 1
+
+
+async def test_content_is_incremental_but_final_empty_waits_for_http_eof():
+    resume, finish = asyncio.Event(), asyncio.Event()
+    middle_wait, eof_wait = asyncio.Event(), asyncio.Event()
+    async def source():
+        yield encode([{"content": "first"}, {}])
+        middle_wait.set()
+        await resume.wait()
+        yield encode([{"content": "tail"}, {}])
+        eof_wait.set()
+        await finish.wait()
+    iterator = frames(source(), max_frame_bytes=10000, max_response_bytes=10000)
+    pending = None
+    try:
+        assert await anext(iterator) == {"content": "first"}
+        pending = asyncio.create_task(anext(iterator))
+        await asyncio.wait_for(middle_wait.wait(), 1)
+        assert not pending.done()
+        resume.set()
+        assert await asyncio.wait_for(pending, 1) == {"content": "tail"}
+        pending = asyncio.create_task(anext(iterator))
+        await asyncio.wait_for(eof_wait.wait(), 1)
+        assert not pending.done()
+        finish.set()
+        assert await asyncio.wait_for(pending, 1) == {}
+        with pytest.raises(StopAsyncIteration):
+            await anext(iterator)
+    finally:
+        resume.set()
+        finish.set()
+        if pending is not None:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        await iterator.aclose()
+
+
+async def test_size_limits_still_apply_after_empty_frames():
+    with pytest.raises(GatewayError, match="回答"):
+        await parse([encode([{}]), encode([{"content": "oversized"}, {}])], response=10)
+    with pytest.raises(GatewayError, match="事件"):
+        await parse([encode([{}]), b'123456789'], frame=8)
 
 
 def test_sse_encodes_one_event_not_literal_newlines():

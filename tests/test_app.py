@@ -124,6 +124,39 @@ async def test_stream_and_nonstream_identical_with_reasoning_tail_and_logs(tmp_p
         assert all(stream.closed for stream in upstream.streams)
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("initial_empty", [False, True])
+async def test_intermediate_empty_delta_never_truncates_answer(tmp_path, stream, initial_empty):
+    values = ([{}] if initial_empty else []) + [
+        {"responseId": "long"}, {"content": "前半段"}, {}, {}, {"content": "后半段🙂"},
+        {"custom_content": {"state": {"claude_message_content": [{"text": "前半段后半段🙂"}]}}}, {},
+    ]
+    async with running(tmp_path, Upstream(values=values)) as (app, client):
+        response = await client.post("/v1/chat/completions", headers=HEADERS, json=payload(stream))
+        assert response.status_code == 200, response.text
+        if stream:
+            data = [line[6:] for line in response.text.splitlines() if line.startswith("data: ")]
+            assert data[-1] == "[DONE]" and data.count("[DONE]") == 1
+            answer = "".join(json.loads(item)["choices"][0]["delta"].get("content", "") for item in data[:-1])
+        else:
+            answer = response.json()["choices"][0]["message"]["content"]
+        assert answer == "前半段后半段🙂"
+        row = (await app.state.logs.listing())["data"][0]
+        assert row["status"] == "success"
+        assert (await app.state.logs.detail(row["id"]))["content"] == answer
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_network_failure_after_empty_frame_is_not_success(tmp_path, stream):
+    upstream = Upstream(values=[{"responseId": "x"}, {"content": "partial"}, {}], fail=True)
+    async with running(tmp_path, upstream) as (app, client):
+        response = await client.post("/v1/chat/completions", headers=HEADERS, json=payload(stream))
+        assert response.status_code == (200 if stream else 502)
+        assert "[DONE]" not in response.text
+        assert '"finish_reason":"stop"' not in response.text
+        assert (await app.state.logs.listing())["data"][0]["status"] == "failed"
+
+
 async def test_broken_stream_error_never_done_and_account_released(tmp_path):
     upstream = Upstream(values=[{"responseId": "x"}, {"content": "partial"}], fail=True)
     async with running(tmp_path, upstream) as (app, client):

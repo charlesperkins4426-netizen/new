@@ -16,6 +16,7 @@ async def frames(
 ) -> AsyncIterator[dict]:
     buffer = bytearray()
     total = 0
+    last_frame_empty = False
     async for chunk in chunks:
         total += len(chunk)
         if total > max_response_bytes:
@@ -34,13 +35,16 @@ async def frames(
                 raise GatewayError(502, "invalid_frame", "上游流包含无效的 UTF-8 或 JSON。") from None
             if not isinstance(frame, dict):
                 raise GatewayError(502, "invalid_frame", "上游事件必须是 JSON 对象。")
-            if not frame and buffer.strip():
-                raise GatewayError(502, "invalid_terminator", "上游结束帧之后仍有数据。")
-            yield frame
-            if not frame:
-                return
+            # DialX can emit empty deltas while generation continues. Only HTTP
+            # EOF can confirm that the last empty frame really ends the answer.
+            last_frame_empty = not frame
+            if frame:
+                yield frame
         if len(buffer) > max_frame_bytes:
             raise GatewayError(502, "frame_too_large", "上游事件超过配置的大小限制。")
+    if last_frame_empty and not buffer:
+        yield {}
+        return
     raise GatewayError(502, "incomplete_stream", "上游连接提前结束，没有完整结束帧。")
 
 
