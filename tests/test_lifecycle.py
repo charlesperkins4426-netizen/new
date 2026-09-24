@@ -10,14 +10,17 @@ from tests.test_app import HEADERS, Upstream, payload, running, wire
 
 
 class PausedStream(httpx.AsyncByteStream):
-    def __init__(self, before_first=False):
+    def __init__(self, before_first=False, empty_before_wait=False):
         self.before_first = before_first
+        self.empty_before_wait = empty_before_wait
         self.waiting = asyncio.Event()
         self.closed = asyncio.Event()
 
     async def __aiter__(self):
         if not self.before_first:
             yield wire([{"responseId": "test"}, {"content": "partial"}])
+        if self.empty_before_wait:
+            yield wire([{}])
         self.waiting.set()
         await asyncio.Event().wait()
 
@@ -25,7 +28,7 @@ class PausedStream(httpx.AsyncByteStream):
         self.closed.set()
 
 
-def asgi_request(app, data, disconnect):
+def asgi_request(app, data, disconnect, messages):
     sent_body = False
     async def receive():
         nonlocal sent_body
@@ -35,7 +38,7 @@ def asgi_request(app, data, disconnect):
         await disconnect.wait()
         return {"type": "http.disconnect"}
     async def send(message):
-        pass
+        messages.append(message)
     scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
              "method": "POST", "path": "/v1/chat/completions", "raw_path": b"/v1/chat/completions",
              "query_string": b"", "scheme": "http", "http_version": "1.1", "root_path": "",
@@ -45,19 +48,27 @@ def asgi_request(app, data, disconnect):
 
 
 @pytest.mark.parametrize("before_first,stream", [(True, False), (True, True), (False, False), (False, True)])
-async def test_disconnect_releases_upstream_without_waiting_for_timeout(tmp_path, before_first, stream):
+@pytest.mark.parametrize("empty_before_wait", [False, True])
+async def test_disconnect_releases_upstream_without_waiting_for_timeout(tmp_path, before_first, stream, empty_before_wait):
     upstream = Upstream()
-    slow = PausedStream(before_first)
+    slow = PausedStream(before_first, empty_before_wait)
     async def handler(request):
         if request.url.path == "/api/chat":
             return httpx.Response(200, headers={"content-type": "application/octet-stream"}, stream=slow)
         return await upstream(request)
     async with running(tmp_path, handler) as (app, _):
         disconnect = asyncio.Event()
-        task = asgi_request(app, payload(stream), disconnect)
+        messages = []
+        task = asgi_request(app, payload(stream), disconnect, messages)
         await asyncio.wait_for(slow.waiting.wait(), 2)
+        assert not task.done()
+        if before_first:
+            assert not any(message["type"] == "http.response.start" for message in messages)
         disconnect.set()
         await asyncio.wait_for(task, 2)
+        body = b"".join(message.get("body", b"") for message in messages)
+        assert b"[DONE]" not in body
+        assert b'"finish_reason":"stop"' not in body.replace(b" ", b"")
         assert slow.closed.is_set()
         assert not any(row["busy"] for row in app.state.pool.snapshot())
         row = (await app.state.logs.listing())["data"][0]
