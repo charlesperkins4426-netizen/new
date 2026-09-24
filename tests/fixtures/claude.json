@@ -1,0 +1,27 @@
+[
+  {
+    "responseId": "captured-response-id"
+  },
+  {
+    "role": "assistant"
+  },
+  {
+    "content": "17×19 = 323"
+  },
+  {
+    "content": "。"
+  },
+  {
+    "custom_content": {
+      "state": {
+        "claude_message_content": [
+          {
+            "text": "17×19 = 323。",
+            "type": "text"
+          }
+        ]
+      }
+    }
+  },
+  {}
+]
